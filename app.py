@@ -1,4 +1,4 @@
-"""技术面试教练的 Streamlit 界面。"""
+"""Streamlit app for interview practice."""
 import streamlit as st
 
 from graph import CATEGORY_LABELS, run_interview

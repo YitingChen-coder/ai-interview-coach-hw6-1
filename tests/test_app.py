@@ -1,4 +1,4 @@
-"""使用真实 LangGraph 和 Streamlit，隔离外部模型请求。"""
+"""Test the graph and UI without making API calls."""
 import json
 import os
 import unittest

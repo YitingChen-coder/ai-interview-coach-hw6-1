@@ -1,4 +1,4 @@
-"""由决策模型选择回答分支的 LangGraph 面试练习流程。"""
+"""Route interview questions to specialist answers with LangGraph."""
 import json
 import os
 from pathlib import Path
@@ -41,7 +41,7 @@ class InterviewState(TypedDict):
 
 
 def build_graph(client: OpenAI, model: str, decision_model: str | None = None):
-    """独立配置决策和生成模型，并编译带条件边的工作流。"""
+    """Build the graph with separate routing and answer models."""
     decision_model = decision_model or model
 
     def ask(instruction: str, context: str, selected_model: str, json_mode: bool = False) -> str:
@@ -124,7 +124,7 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None):
 
 
 def run_interview(question: str) -> InterviewState:
-    """校验配置，通过 OpenRouter 执行工作流并转换常见 API 错误。"""
+    """Run a question through the graph and handle API errors."""
     question = question.strip()
     if not question:
         raise ValueError('请输入技术面试问题。')
