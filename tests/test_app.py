@@ -1,62 +1,166 @@
-"""Offline checks: real graph and Streamlit, mocked OpenAI network boundary."""
-import importlib.util
+"""使用真实 LangGraph 和 Streamlit，隔离外部模型请求。"""
 import json
 import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import httpx
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
+
+from graph import build_graph, run_interview
 
 
-class CoachTests(unittest.TestCase):
-    def test_three_stages_propagate_state(self):
-        self.assertIsNotNone(importlib.util.find_spec('graph'), 'graph.py must exist')
-        from graph import build_graph
-        from openai import OpenAI
-        replies = iter(['Backend', 'An index speeds up reads but adds write overhead.',
-                        json.dumps({'questions': ['When would you avoid an index?', 'How do composite indexes work?']})])
-        prompts = []
+def response(content):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
-        def complete(**kwargs):
-            prompts.append(kwargs['messages'])
-            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=next(replies)))])
 
-        with patch.dict(os.environ, {name: '' for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')}), OpenAI(api_key='offline-test-key') as client:
-            with patch.object(client.chat.completions, 'create', side_effect=complete):
-                result = build_graph(client, 'gpt-4.1-mini').invoke({'question': 'Explain database indexes.'})
+def decision(category='Backend', reason='问题涉及数据库实现。'):
+    return json.dumps({'category': category, 'reason': reason}, ensure_ascii=False)
+
+
+FOLLOW_UPS = json.dumps({'questions': ['什么时候不适合建立索引？', '复合索引有什么限制？']}, ensure_ascii=False)
+
+
+class GraphTests(unittest.TestCase):
+    def test_each_decision_runs_only_its_specialist(self):
+        branches = {'Algorithms': 'algorithms_answer', 'Backend': 'backend_answer',
+                    'System Design': 'system_design_answer', 'AI/LLM': 'ai_answer'}
+        for category, branch in branches.items():
+            with self.subTest(category=category):
+                client = MagicMock()
+                client.chat.completions.create.side_effect = [response(decision(category)), response('索引提升读取效率，但增加写入开销。'), response(FOLLOW_UPS)]
+                workflow = build_graph(client, 'test/answer', 'test/decision')
+                events = list(workflow.stream({'question': '解释数据库索引。'}, stream_mode='updates'))
+                self.assertEqual([next(iter(event)) for event in events], ['decision_model', branch, 'follow_up_generator'])
+                result = {}
+                for event in events:
+                    result.update(next(iter(event.values())))
+                self.assertEqual(result['category'], category)
+                self.assertEqual(result['route'], branch)
+                self.assertEqual(result['decision_reason'], '问题涉及数据库实现。')
+                self.assertEqual(result['execution_path'], ['decision_model', branch, 'follow_up_generator'])
+                self.assertEqual(len(result['follow_ups']), 2)
+                calls = client.chat.completions.create.call_args_list
+                self.assertEqual([c.kwargs['model'] for c in calls], ['test/decision', 'test/answer', 'test/answer'])
+                self.assertIn('中文', calls[1].kwargs['messages'][0]['content'])
+                self.assertIn(category, calls[1].kwargs['messages'][1]['content'])
+                self.assertIn(result['answer'], calls[2].kwargs['messages'][1]['content'])
+
+    def test_invalid_decisions_stop_before_answer(self):
+        for raw in ['not json', '[]', decision('Unknown'), decision(reason=' '), decision(reason=3), '{"reason":"x"}']:
+            with self.subTest(raw=raw):
+                client = MagicMock()
+                client.chat.completions.create.return_value = response(raw)
+                with self.assertRaisesRegex(ValueError, '决策'):
+                    build_graph(client, 'answer', 'decision').invoke({'question': '解释索引'})
+                self.assertEqual(client.chat.completions.create.call_count, 1)
+
+    def test_empty_responses(self):
+        for content in [None, '', '   ']:
+            client = MagicMock()
+            client.chat.completions.create.return_value = response(content)
+            with self.assertRaisesRegex(ValueError, '空'):
+                build_graph(client, 'answer', 'decision').invoke({'question': '解释索引'})
+        client.chat.completions.create.return_value = SimpleNamespace(choices=[])
+        with self.assertRaisesRegex(ValueError, '空'):
+            build_graph(client, 'answer', 'decision').invoke({'question': '解释索引'})
+
+    def test_invalid_follow_ups(self):
+        for raw in ['no json', '[]', '{}', '{"questions":["a"]}', '{"questions":["a"," a "]}', '{"questions":["a",3]}', '{"questions":["a"," "]}']:
+            client = MagicMock()
+            client.chat.completions.create.side_effect = [response(decision()), response('回答'), response(raw)]
+            with self.assertRaisesRegex(ValueError, '追问'):
+                build_graph(client, 'answer', 'decision').invoke({'question': '解释索引'})
+
+    def test_validation(self):
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': ''}):
+            with self.assertRaisesRegex(ValueError, '问题'):
+                run_interview('  ')
+            with self.assertRaisesRegex(ValueError, 'OPENROUTER_API_KEY'):
+                run_interview('解释索引')
+
+    @patch.dict(os.environ, {'OPENROUTER_API_KEY': 'offline-key', 'DECISION_MODEL': 'test/decision', 'ANSWER_MODEL': 'test/answer'})
+    def test_openrouter_configuration(self):
+        with patch('graph.OpenAI') as factory:
+            client = factory.return_value.__enter__.return_value
+            client.chat.completions.create.side_effect = [response(decision()), response('回答'), response(FOLLOW_UPS)]
+            result = run_interview('  解释索引  ')
+        self.assertEqual(factory.call_args.kwargs['base_url'], 'https://openrouter.ai/api/v1')
+        self.assertEqual(factory.call_args.kwargs['api_key'], 'offline-key')
+        self.assertEqual(result['question'], '解释索引')
+        self.assertEqual(result['decision_model'], 'test/decision')
+        self.assertEqual(result['answer_model'], 'test/answer')
+        self.assertEqual(result['provider'], 'OpenRouter')
+
+    def test_real_sdk_serializes_openrouter_requests(self):
+        requests = []
+        replies = iter([decision(), '索引提升读取效率。', FOLLOW_UPS])
+
+        def serve(request):
+            requests.append(request)
+            return httpx.Response(200, json={
+                'id': 'offline', 'object': 'chat.completion', 'created': 0,
+                'model': 'test/model', 'choices': [{'index': 0,
+                    'message': {'role': 'assistant', 'content': next(replies)},
+                    'finish_reason': 'stop'}],
+            })
+
+        with httpx.Client(transport=httpx.MockTransport(serve)) as http_client:
+            with OpenAI(api_key='offline-key', base_url='https://openrouter.ai/api/v1',
+                        http_client=http_client) as client:
+                result = build_graph(client, 'test/answer', 'test/decision').invoke({'question': '解释索引'})
         self.assertEqual(result['category'], 'Backend')
-        self.assertIn('write overhead', result['answer'])
-        self.assertEqual(len(result['follow_ups']), 2)
-        self.assertIn('Backend', prompts[1][1]['content'])
-        self.assertIn(result['answer'], prompts[2][1]['content'])
+        self.assertEqual(len(requests), 3)
+        for request in requests:
+            self.assertEqual(str(request.url), 'https://openrouter.ai/api/v1/chat/completions')
+            self.assertEqual(request.headers['authorization'], 'Bearer offline-key')
+        bodies = [json.loads(request.content) for request in requests]
+        self.assertEqual([b['model'] for b in bodies], ['test/decision', 'test/answer', 'test/answer'])
+        self.assertEqual(bodies[0]['response_format'], {'type': 'json_object'})
+        self.assertNotIn('response_format', bodies[1])
+        self.assertEqual(bodies[2]['response_format'], {'type': 'json_object'})
 
-    def test_missing_key_and_blank_question(self):
-        self.assertIsNotNone(importlib.util.find_spec('graph'), 'graph.py must exist')
-        from graph import run_interview
-        with self.assertRaisesRegex(ValueError, 'question'):
-            run_interview('  ')
-        with patch.dict(os.environ, {'OPENAI_API_KEY': ''}):
-            with self.assertRaisesRegex(ValueError, 'OPENAI_API_KEY'):
-                run_interview('Explain a hash table.')
+    def test_api_errors_are_readable(self):
+        request = httpx.Request('POST', 'https://openrouter.ai/api/v1/chat/completions')
+        errors = [
+            (AuthenticationError('bad', response=httpx.Response(401, request=request), body=None), '认证'),
+            (RateLimitError('quota', response=httpx.Response(429, request=request), body=None), '额度'),
+            (APITimeoutError(request=request), '超时'),
+            (APIConnectionError(request=request), '连接'),
+            (APIStatusError('bad', response=httpx.Response(503, request=request), body=None), '503'),
+        ]
+        for error, message in errors:
+            with self.subTest(error=type(error).__name__), patch.dict(os.environ, {'OPENROUTER_API_KEY': 'offline-key'}), patch('graph.OpenAI', side_effect=error):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    run_interview('解释索引')
 
-    def test_ui_history_and_failure(self):
-        self.assertIsNotNone(importlib.util.find_spec('graph'), 'graph.py must exist')
+
+class InterfaceTests(unittest.TestCase):
+    def test_chinese_history_and_error_display(self):
         from streamlit.testing.v1 import AppTest
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'app.py')).run()
         self.assertFalse(app.exception)
-        result = {'question': 'Explain indexes.', 'category': 'Backend',
-                  'answer': 'Indexes speed up reads.', 'follow_ups': ['What is the write cost?', 'What is a covering index?']}
+        self.assertEqual(app.title[0].value, '技术面试教练')
+        result = {'question': '解释索引', 'category': 'Backend', 'answer': '索引加快读取。',
+                  'follow_ups': ['写入代价是什么？', '什么是覆盖索引？'], 'decision_reason': '涉及数据库。',
+                  'route': 'backend_answer', 'execution_path': ['decision_model', 'backend_answer', 'follow_up_generator'],
+                  'decision_model': 'test/decision', 'answer_model': 'test/answer', 'provider': 'OpenRouter'}
         with patch('graph.run_interview', return_value=result):
-            app.text_area[0].input('Explain indexes.')
+            app.text_area[0].input('解释索引')
             app.button[0].click().run()
         self.assertEqual(len(app.session_state['history']), 1)
         app.run()
-        self.assertTrue(any('Indexes speed up reads.' in m.value for m in app.markdown))
-        with patch('graph.run_interview', side_effect=RuntimeError('OpenAI connection failed.')):
-            app.text_area[0].input('Explain caching.')
+        content = '\n'.join(m.value for m in app.markdown)
+        self.assertIn('涉及数据库。', content)
+        self.assertIn('backend_answer', content)
+        self.assertIn('test/decision', content)
+        with patch('graph.run_interview', side_effect=RuntimeError('OpenRouter 连接失败。')):
+            app.text_area[0].input('解释缓存')
             app.button[0].click().run()
         self.assertEqual(len(app.session_state['history']), 1)
-        self.assertIn('connection failed', app.error[0].value)
+        self.assertIn('连接失败', app.error[0].value)
         self.assertFalse(app.exception)
 
 
