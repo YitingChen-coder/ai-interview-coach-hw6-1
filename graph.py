@@ -25,6 +25,8 @@ SPECIALIST_PROMPTS = {
     'AI/LLM': '解释相关模型或技术原理，说明应用流程、评估方法、局限及成本权衡。',
 }
 DEFAULT_MODEL = 'openai/gpt-4.1-mini'
+DEFAULT_COMPLEX_MODEL = 'openai/gpt-4.1'
+COMPLEXITY_LABELS = {'simple': '基础题', 'complex': '复杂题'}
 
 
 class InterviewState(TypedDict):
@@ -33,6 +35,7 @@ class InterviewState(TypedDict):
     answer: str
     follow_ups: list[str]
     decision_reason: str
+    complexity: Literal['simple', 'complex']
     route: str
     execution_path: list[str]
     decision_model: str
@@ -40,8 +43,9 @@ class InterviewState(TypedDict):
     provider: str
 
 
-def build_graph(client: OpenAI, model: str, decision_model: str | None = None):
-    """Build the graph with separate routing and answer models."""
+def build_graph(client: OpenAI, model: str, decision_model: str | None = None,
+                *, complex_model: str = DEFAULT_COMPLEX_MODEL):
+    """Build the graph with lightweight and complex-question models."""
     decision_model = decision_model or model
 
     def ask(instruction: str, context: str, selected_model: str, json_mode: bool = False) -> str:
@@ -66,8 +70,11 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None):
         raw = ask(
             '你负责决定技术面试题应进入哪个专家回答分支。'
             'category 必须是 Algorithms、Backend、System Design、AI/LLM 中的一项。'
-            '跨领域题目选择主要考查方向。仅返回 JSON 对象，包含 category 和 reason；'
-            'reason 用一句中文简要说明分类依据，不需要展开推理过程。',
+            '跨领域题目选择主要考查方向。同时判断 complexity：'
+            'simple 表示概念解释、单一机制或常见基础算法；'
+            'complex 表示需要多步推理、多个约束下的方案权衡、分布式架构或复杂算法证明。'
+            '不要只根据题目长度或类别判断复杂度。仅返回 JSON 对象，包含 category、complexity 和 reason；'
+            'reason 用一句中文简要说明分类及复杂度依据，不需要展开推理过程。',
             state['question'], decision_model, json_mode=True,
         )
         try:
@@ -75,20 +82,28 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None):
             if not isinstance(data, dict):
                 raise ValueError
             category, reason = data.get('category'), data.get('reason')
-            if category not in CATEGORIES or not isinstance(reason, str) or not reason.strip():
+            complexity = data.get('complexity')
+            if (category not in CATEGORIES or complexity not in ('simple', 'complex')
+                    or not isinstance(reason, str) or not reason.strip()):
                 raise ValueError
         except (json.JSONDecodeError, ValueError):
-            raise ValueError('决策模型未返回有效类别和决策理由，请重试。') from None
-        return {'category': category, 'decision_reason': reason.strip(), 'route': ROUTES[category],
+            raise ValueError('决策模型未返回有效类别、复杂度和决策理由，请重试。') from None
+        return {'category': category, 'complexity': complexity,
+                'decision_reason': reason.strip(), 'route': ROUTES[category],
                 'execution_path': ['decision_model'], 'decision_model': decision_model,
-                'answer_model': model, 'provider': 'OpenRouter'}
+                'provider': 'OpenRouter'}
+
+    def model_router(state: InterviewState) -> dict:
+        selected = complex_model if state['complexity'] == 'complex' else model
+        return {'answer_model': selected,
+                'execution_path': state['execution_path'] + ['model_router']}
 
     def specialist(category: Category):
         def generate(state: InterviewState) -> dict:
             answer = ask(
                 '你是技术面试教练。给出简洁、准确的参考回答，约 300–500 字。'
                 '使用清晰的 Markdown，说明必要假设，不编造事实。' + SPECIALIST_PROMPTS[category],
-                f"类别：{state['category']}\n问题：{state['question']}", model,
+                f"类别：{state['category']}\n问题：{state['question']}", state['answer_model'],
             )
             return {'answer': answer, 'execution_path': state['execution_path'] + [ROUTES[category]]}
         return generate
@@ -97,7 +112,7 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None):
         raw = ask(
             '作为面试官，根据问题和参考回答，提出恰好两条不同且相关的深入追问。'
             '仅返回 JSON 对象，键 questions 对应两个非空字符串组成的数组。',
-            f"问题：{state['question']}\n参考回答：{state['answer']}", model, json_mode=True,
+            f"问题：{state['question']}\n参考回答：{state['answer']}", state['answer_model'], json_mode=True,
         )
         try:
             data = json.loads(raw)
@@ -113,12 +128,14 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None):
 
     workflow = StateGraph(InterviewState)
     workflow.add_node('decision_model', choose_route)
+    workflow.add_node('model_router', model_router)
     workflow.add_node('follow_up_generator', follow_up_generator)
     for category, node_name in ROUTES.items():
         workflow.add_node(node_name, specialist(category))
         workflow.add_edge(node_name, 'follow_up_generator')
     workflow.add_edge(START, 'decision_model')
-    workflow.add_conditional_edges('decision_model', lambda state: state['category'], ROUTES)
+    workflow.add_edge('decision_model', 'model_router')
+    workflow.add_conditional_edges('model_router', lambda state: state['category'], ROUTES)
     workflow.add_edge('follow_up_generator', END)
     return workflow.compile()
 
@@ -133,10 +150,11 @@ def run_interview(question: str) -> InterviewState:
         raise ValueError('请在 .env 中设置 OPENROUTER_API_KEY，然后重启应用。')
     model = os.getenv('ANSWER_MODEL', DEFAULT_MODEL).strip() or DEFAULT_MODEL
     decision_model = os.getenv('DECISION_MODEL', DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    complex_model = os.getenv('COMPLEX_ANSWER_MODEL', DEFAULT_COMPLEX_MODEL).strip() or DEFAULT_COMPLEX_MODEL
     try:
         with OpenAI(api_key=api_key, base_url='https://openrouter.ai/api/v1',
                     timeout=30.0, max_retries=0) as client:
-            return build_graph(client, model, decision_model).invoke({'question': question})
+            return build_graph(client, model, decision_model, complex_model=complex_model).invoke({'question': question})
     except AuthenticationError:
         raise RuntimeError('OpenRouter 认证失败，请检查 OPENROUTER_API_KEY。') from None
     except RateLimitError:
