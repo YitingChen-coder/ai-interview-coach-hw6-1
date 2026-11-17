@@ -24,48 +24,52 @@ FOLLOW_UPS = json.dumps({'questions': ['什么时候不适合建立索引？', '
 
 
 class GraphTests(unittest.TestCase):
-    def test_each_decision_runs_only_its_specialist(self):
+    def test_categories_and_model_routing(self):
         branches = {'Algorithms': 'algorithms_answer', 'Backend': 'backend_answer',
                     'System Design': 'system_design_answer', 'AI/LLM': 'ai_answer'}
+        focus = {'Algorithms': '时间与空间复杂度', 'Backend': '数据一致性',
+                 'System Design': '规模假设', 'AI/LLM': '评估方法'}
+        models = {'simple': 'test/light', 'complex': 'test/strong'}
         for category, branch in branches.items():
-            with self.subTest(category=category):
-                client = MagicMock()
-                client.chat.completions.create.side_effect = [response(decision(category)), response('索引提升读取效率，但增加写入开销。'), response(FOLLOW_UPS)]
-                workflow = build_graph(client, 'test/answer', 'test/decision')
-                events = list(workflow.stream({'question': '解释数据库索引。'}, stream_mode='updates'))
-                self.assertEqual([next(iter(event)) for event in events], ['decision_model', 'model_router', branch, 'follow_up_generator'])
-                result = {}
-                for event in events:
-                    result.update(next(iter(event.values())))
-                self.assertEqual(result['category'], category)
-                self.assertEqual(result['route'], branch)
-                self.assertEqual(result['decision_reason'], '问题涉及数据库实现。')
-                self.assertEqual(result['execution_path'], ['decision_model', 'model_router', branch, 'follow_up_generator'])
-                self.assertEqual(len(result['follow_ups']), 2)
-                calls = client.chat.completions.create.call_args_list
-                self.assertEqual([c.kwargs['model'] for c in calls], ['test/decision', 'test/answer', 'test/answer'])
-                self.assertIn('中文', calls[1].kwargs['messages'][0]['content'])
-                self.assertIn(category, calls[1].kwargs['messages'][1]['content'])
-                self.assertIn(result['answer'], calls[2].kwargs['messages'][1]['content'])
-
-    def test_complexity_selects_answer_model_for_both_generation_steps(self):
-        for complexity, expected_model in [('simple', 'test/light'), ('complex', 'test/strong')]:
-            with self.subTest(complexity=complexity):
-                client = MagicMock()
-                client.chat.completions.create.side_effect = [
-                    response(decision(complexity=complexity)), response('回答'), response(FOLLOW_UPS)]
-                result = build_graph(client, 'test/light', 'test/decision',
-                                     complex_model='test/strong').invoke({'question': '解释索引'})
-                self.assertEqual(result['complexity'], complexity)
-                self.assertEqual(result['answer_model'], expected_model)
-                self.assertEqual(result['execution_path'],
-                                 ['decision_model', 'model_router', 'backend_answer', 'follow_up_generator'])
-                calls = client.chat.completions.create.call_args_list
-                self.assertEqual([call.kwargs['model'] for call in calls],
-                                 ['test/decision', expected_model, expected_model])
+            for complexity, expected_model in models.items():
+                with self.subTest(category=category, complexity=complexity):
+                    client = MagicMock()
+                    client.chat.completions.create.side_effect = [
+                        response(decision(category, complexity=complexity)),
+                        response('索引提升读取效率，但增加写入开销。'),
+                        response(FOLLOW_UPS),
+                    ]
+                    workflow = build_graph(client, 'test/light', 'test/decision',
+                                           complex_model='test/strong')
+                    events = list(workflow.stream({'question': '解释数据库索引。'},
+                                                  stream_mode='updates'))
+                    path = ['decision_model', 'model_router', branch, 'follow_up_generator']
+                    self.assertEqual([next(iter(event)) for event in events], path)
+                    result = {}
+                    for event in events:
+                        result.update(next(iter(event.values())))
+                    self.assertEqual(result['category'], category)
+                    self.assertEqual(result['complexity'], complexity)
+                    self.assertEqual(result['route'], branch)
+                    self.assertEqual(result['decision_reason'], '问题涉及数据库实现。')
+                    self.assertEqual(result['execution_path'], path)
+                    self.assertEqual(result['answer_model'], expected_model)
+                    self.assertEqual(len(result['follow_ups']), 2)
+                    calls = client.chat.completions.create.call_args_list
+                    self.assertEqual([call.kwargs['model'] for call in calls],
+                                     ['test/decision', expected_model, expected_model])
+                    self.assertIn('中文', calls[1].kwargs['messages'][0]['content'])
+                    self.assertIn(focus[category], calls[1].kwargs['messages'][0]['content'])
+                    self.assertIn(category, calls[1].kwargs['messages'][1]['content'])
+                    self.assertIn(result['answer'], calls[2].kwargs['messages'][1]['content'])
 
     def test_invalid_decisions_stop_before_answer(self):
-        for raw in ['not json', '[]', decision('Unknown'), decision(reason=' '), decision(reason=3), decision(complexity='medium'), decision(complexity=None), decision(complexity=[]), '{"category":"Backend","reason":"x"}', '{"reason":"x"}']:
+        invalid = [
+            'not json', '[]', decision('Unknown'), decision(reason=' '), decision(reason=3),
+            decision(complexity='medium'), decision(complexity=None), decision(complexity=[]),
+            '{"category":"Backend","reason":"x"}', '{"reason":"x"}',
+        ]
+        for raw in invalid:
             with self.subTest(raw=raw):
                 client = MagicMock()
                 client.chat.completions.create.return_value = response(raw)

@@ -45,7 +45,6 @@ class InterviewState(TypedDict):
 
 def build_graph(client: OpenAI, model: str, decision_model: str | None = None,
                 *, complex_model: str = DEFAULT_COMPLEX_MODEL):
-    """Build the graph with lightweight and complex-question models."""
     decision_model = decision_model or model
 
     def ask(instruction: str, context: str, selected_model: str, json_mode: bool = False) -> str:
@@ -59,12 +58,10 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None,
             ],
             **options,
         )
-        if not response.choices or not response.choices[0].message.content:
+        content = response.choices[0].message.content if response.choices else None
+        if not content or not content.strip():
             raise ValueError('OpenRouter 返回了空响应，请重试。')
-        content = response.choices[0].message.content.strip()
-        if not content:
-            raise ValueError('OpenRouter 返回了空响应，请重试。')
-        return content
+        return content.strip()
 
     def choose_route(state: InterviewState) -> dict:
         raw = ask(
@@ -98,15 +95,14 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None,
         return {'answer_model': selected,
                 'execution_path': state['execution_path'] + ['model_router']}
 
-    def specialist(category: Category):
-        def generate(state: InterviewState) -> dict:
-            answer = ask(
-                '你是技术面试教练。给出简洁、准确的参考回答，约 300–500 字。'
-                '使用清晰的 Markdown，说明必要假设，不编造事实。' + SPECIALIST_PROMPTS[category],
-                f"类别：{state['category']}\n问题：{state['question']}", state['answer_model'],
-            )
-            return {'answer': answer, 'execution_path': state['execution_path'] + [ROUTES[category]]}
-        return generate
+    def generate_answer(state: InterviewState) -> dict:
+        category = state['category']
+        answer = ask(
+            '你是技术面试教练。给出简洁、准确的参考回答，约 300–500 字。'
+            '使用清晰的 Markdown，说明必要假设，不编造事实。' + SPECIALIST_PROMPTS[category],
+            f"类别：{category}\n问题：{state['question']}", state['answer_model'],
+        )
+        return {'answer': answer, 'execution_path': state['execution_path'] + [ROUTES[category]]}
 
     def follow_up_generator(state: InterviewState) -> dict:
         raw = ask(
@@ -130,8 +126,9 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None,
     workflow.add_node('decision_model', choose_route)
     workflow.add_node('model_router', model_router)
     workflow.add_node('follow_up_generator', follow_up_generator)
-    for category, node_name in ROUTES.items():
-        workflow.add_node(node_name, specialist(category))
+    # Each branch uses the prompt for its category.
+    for node_name in ROUTES.values():
+        workflow.add_node(node_name, generate_answer)
         workflow.add_edge(node_name, 'follow_up_generator')
     workflow.add_edge(START, 'decision_model')
     workflow.add_edge('decision_model', 'model_router')
@@ -141,7 +138,6 @@ def build_graph(client: OpenAI, model: str, decision_model: str | None = None,
 
 
 def run_interview(question: str) -> InterviewState:
-    """Run a question through the graph and handle API errors."""
     question = question.strip()
     if not question:
         raise ValueError('请输入技术面试问题。')
