@@ -6,12 +6,14 @@ Generative AI — HW 7-2，基于 HW 6-1 的 LangGraph 面试练习项目改进�
 
 ## 本次改进
 
-本项目完成作业中的两项要求：
+本次加入 OpenRouter 接入和基于 LLM 的分支选择：
 
 | 要求 | 实现 |
 | --- | --- |
-| 使用决策模型 | `decision_model` 节点输出类别和简短依据，LangGraph 条件边据此选择一个专家回答节点。 |
+| LLM 分支选择 | `decision_model` 节点输出类别和简短依据，LangGraph 条件边据此选择一个专家回答节点。 |
 | 使用路由服务 | 所有模型请求发送到 OpenRouter；决策模型与回答模型可分别配置。 |
+
+这里的 `decision_model` 是节点名称，默认仍使用普通聊天模型生成 JSON 分类，并非 Jev 或 SemIf 这类专门的 Decision Model。OpenRouter 用作统一 API 入口，目前没有按题目复杂度动态切换回答模型。因此，本版本不将 Extra Credit 标为已完成。
 
 原作业是“分类 → 通用回答 → 追问”的固定流程。本次分类结果实际控制执行分支，每个回答节点有独立的专业提示：算法强调复杂度和边界情况，后端强调实现与性能，系统设计强调架构与权衡，AI/LLM 强调原理、评估和应用限制。
 
@@ -96,7 +98,14 @@ python -m pip check
 
 离线测试隔离外部网络，覆盖四条分支、不同模型配置、OpenRouter 请求格式、无效响应、常见 API 错误，以及界面历史保留。测试不会产生真实模型费用。AppTest 在独立运行时可能输出 `missing ScriptRunContext` 提示，不影响测试结果。
 
-开发时已查询 OpenRouter 模型列表，确认默认模型列出 `response_format` 支持。当前未配置有效 OpenRouter 密钥，尚未验证真实模型生成；填写密钥后可按上面的四类问题检查完整流程。
+2026-11-17 已使用 OpenRouter 密钥完成两次真实流程验证，决策和生成均使用 `openai/gpt-4.1-mini`：
+
+| 验证方式 | 问题 | 结果 |
+| --- | --- | --- |
+| 直接调用 `run_interview()` | 数据库索引如何加快查询，有哪些代价？ | 进入 `backend_answer`，返回中文回答和两条追问，约 8 秒。 |
+| Streamlit AppTest 提交表单，真实调用 API | 有序数组的二分查找及其复杂度 | 进入 `algorithms_answer`，结果写入练习历史，返回中文回答和两条追问，无界面异常。 |
+
+同时启动了 Streamlit 服务，健康检查返回 HTTP 200。9 项离线测试、语法检查和依赖检查通过。界面提交流程使用 AppTest 验证，未进行浏览器视觉检查。这些是本地验证结果，不是 GitHub Actions 记录。密钥只保存在被 Git 忽略的本地 `.env` 中。
 
 ## 参考资料
 
